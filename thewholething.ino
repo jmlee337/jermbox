@@ -72,14 +72,22 @@
 // basically only used for angles
 #define O_MAX 70
 
+// Period length is 5 us
+// 72 MHz * 2.5 us
+#define CYCLES_HALF 180
+
+// Period length is 5 us
+// 72 MHz * 10 us
+#define CYCLES_TWO 720
+
 bool passedAll = false;
-bool invalid = false;
-bool shortInvalid = false;
-uint8_t shortError = 0;
-bool longInvalid = false;
-uint32_t longError = 0;
+
+uint32_t fallTime = 0;
+uint32_t buffer = 0;
+uint8_t bitsRead = 0;
 
 void setup() {
+  cli();
   pinMode(PIN, INPUT);
   pinMode(LED, OUTPUT);
   digitalWrite(LED, LOW);
@@ -107,86 +115,69 @@ void setup() {
   pinMode(S_TLEFT, INPUT_PULLUP);
   pinMode(S_TDOWN, INPUT_PULLUP);
   pinMode(S_TRIGHT, INPUT_PULLUP);
+
+  ARM_DEMCR |= ARM_DEMCR_TRCENA;
+  ARM_DWT_CTRL |= ARM_DWT_CTRL_CYCCNTENA;
 }
 
 void loop() {
-  if (invalid) {
-    showDebug();
-  } else {
-    while(digitalReadFast(PIN) == HIGH) {}
-    readBitsAndRespond();
-  }
-}
-
-void readBitsAndRespond() {
-  uint32_t buffer = 0;
-  int i = 0;
-
-  // First 8 bits are guaranteed
-  for (; i < 8; i++) {
-    uint8_t nextBit = readBit();
-    buffer = (buffer << 1) | nextBit;
-  }
-
-  // The 9th bit tells us if it's an 8 bit message
-  // or a 24 bit message.
-  if (readBit()) {
-    if (buffer == 0x0) {
-      respondWithId();
-    } else if (buffer == 0x41) {
-      respondWithOrigins();
-    } else {
-      invalid = true;
-      shortInvalid = true;
-      shortError = buffer;
-      return;
+  while (1) {
+    // Wait for falling edge
+    while (digitalReadFast(PIN) == HIGH);
+    uint32_t newFallTime = ARM_DWT_CYCCNT;
+    if (newFallTime - fallTime > CYCLES_TWO) {
+      // start of new command
+      buffer = 0;
+      bitsRead = 0;
     }
-  } else {
-    i++;
-    buffer = buffer << 1;
-    for (; i < 24; i++) {
-      uint8_t nextBit = readBit();
-      buffer = (buffer << 1) | nextBit;
-    }
+    fallTime = newFallTime;
 
-    // verify the STOP bit.
-    if (!readBit()) {
-      invalid = true;
-      return;
-    }
-
-    // the bottom two bits of the command control rumble.
-    // mask them out cuz we don't care, but for reference:
-    // XXXXXX00, brake off, motor off
-    // XXXXXX01, brake off, motor on
-    // XXXXXX10, brake on, motor off
-    // XXXXXX11, brake on, motor on? idk
-    buffer &= 0xFFFFFFFC;
-    if (buffer == 0x00400000) {
-      respondWithCalibration();
-    } else {
-      if (!passedAll) {
-        digitalWriteFast(LED, HIGH);
-        passedAll = true;
+    // Wait for rising edge
+    while (digitalReadFast(PIN) == LOW);
+    uint32_t cycles = ARM_DWT_CYCCNT - fallTime;
+    buffer = (buffer << 1) | (cycles > CYCLES_HALF ? 0 : 1);
+    bitsRead++;
+    if (bitsRead == 9) {
+      if (buffer & 0x1) {
+        handleShort(buffer >> 1);
       }
-      respondWithData();
+    } else if (bitsRead == 25) {
+      if (buffer & 0x1) {
+        handleLong(buffer >> 1);
+      }
     }
   }
 }
 
-uint8_t readBit() {
-  delayMicroseconds(2);
-  uint8_t ret = digitalReadFast(PIN) == HIGH ? 1 : 0;
-  delayMicroseconds(2);
-  __asm__ __volatile__ ("nop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\t");
-  __asm__ __volatile__ ("nop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\t");
-  __asm__ __volatile__ ("nop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\t");
-  __asm__ __volatile__ ("nop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\t");
-  __asm__ __volatile__ ("nop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\t");
-  __asm__ __volatile__ ("nop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\t");
-  __asm__ __volatile__ ("nop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\t");
-  __asm__ __volatile__ ("nop\n\tnop\n\t");
-  return ret;
+void handleShort(uint32_t buffer) {
+  if (buffer == 0x0) {
+    respondWithId();
+  } else if (buffer == 0x41) {
+    respondWithOrigins();
+  }
+}
+
+void handleLong(uint32_t buffer) {
+  // the bottom two bits of the command control rumble.
+  // mask them out cuz we don't care, but for reference:
+  // XXXXXX00, brake off, motor off
+  // XXXXXX01, brake off, motor on
+  // XXXXXX10, brake on, motor off
+  // XXXXXX11, brake on, motor on? idk
+  buffer &= 0xFFFFFFFC;
+
+  if (buffer == 0x00400000) {
+    respondWithCalibration();
+  } else {
+    // Technically, we should check for the right commands
+    // before responding, but we don't actually know what
+    // all the commands are
+    if (!passedAll) {
+      digitalWriteFast(LED, HIGH);
+      passedAll = true;
+    }
+    respondWithData();
+  }
 }
 
 void respondWithId() {
@@ -420,53 +411,5 @@ void send1() {
   delayMicroseconds(1);
   digitalWriteFast(PIN, HIGH);
   delayMicroseconds(3);
-}
-
-// If there was some sort of error, blink out the read data
-void showDebug() {
-  digitalWrite(LED, LOW);
-  if (shortInvalid) {
-    uint8_t out = shortError;
-    for (int i = 0; i < 8; i++) {
-      if (out & 0x80) {
-        ledDash();
-      } else {
-        ledDot();
-      }
-      out = out << 1;
-    }
-    delay(2000);
-  } else if (longInvalid) {
-    uint32_t out = longError;
-    out = out << 8;
-    for (int i = 0; i < 24; i++) {
-      if (out & 0x80000000) {
-        ledDash();
-      } else {
-        ledDot();
-      }
-      out = out << 1;
-    }
-    delay(2000);
-  } else {
-    digitalWrite(LED, HIGH);
-    delay(100);
-    digitalWrite(LED, LOW);
-    delay(100);
-  }
-}
-
-void ledDot() {
-  digitalWrite(LED, HIGH);
-  delay(100);
-  digitalWrite(LED, LOW);
-  delay(400);
-}
-
-void ledDash() {
-  digitalWrite(LED, HIGH);
-  delay(400);
-  digitalWrite(LED, LOW);
-  delay(100);
 }
 
